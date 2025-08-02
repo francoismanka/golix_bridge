@@ -1,34 +1,14 @@
-import express from "express";
-import cors from "cors";
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Route de test
-app.get("/ping", (req, res) => {
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.json({ status: "OK", message: "Golix Bridge opérationnel" });
-});
-
-// Route commande
-app.post("/send-command", (req, res) => {
-  const { command } = req.body;
-
-  if (!command) {
-    return res.status(400).json({ status: "error", message: "Aucune commande reçue" });
+{
+  "name": "golix-bridge",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "node-fetch": "^3.3.2"
   }
-
-  console.log("Commande reçue :", command);
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.json({ status: "success", command });
-});
-
-// Lancement serveur
-app.listen(PORT, () => {
-  console.log(`Golix Bridge en ligne sur le port ${PORT}`);
-});
+}

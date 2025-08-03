@@ -1,83 +1,51 @@
-// index.js - Golix Bridge avec moteur d'exécution des commandes
-import express from "express";
-import cors from "cors";
+import fetch from "node-fetch";
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+// Route pour mise à jour automatique
+app.post("/auto-update", async (req, res) => {
+    const { commitMessage, fileContent } = req.body;
 
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// =========================
-// Route de test
-// =========================
-app.get("/ping", (req, res) => {
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.json({ status: "OK", message: "Golix Bridge opérationnel" });
-});
-
-// =========================
-// Réception commande manuelle
-// =========================
-app.post("/send-command", (req, res) => {
-    const { command } = req.body;
-    if (!command) {
-        return res.status(400).json({ status: "error", message: "Aucune commande reçue" });
+    if (!commitMessage || !fileContent) {
+        return res.status(400).json({ status: "error", message: "Données manquantes" });
     }
 
-    console.log("📥 Commande reçue :", command);
+    try {
+        // 1️⃣ Mettre à jour le fichier sur GitHub
+        const repo = "TON_USER_GITHUB/golix_bridge"; // <-- À remplacer
+        const branch = "main";
+        const filePath = "index.js";
 
-    // Exécuter la commande
-    executeGolixCommand(command);
+        // Récupérer SHA du fichier
+        const getFile = await fetch(`https://api.github.com/repos/${repo}/contents/${filePath}?ref=${branch}`, {
+            headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, "Content-Type": "application/json" }
+        });
+        const fileData = await getFile.json();
 
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.json({ status: "success", command });
-});
+        // Commit sur GitHub
+        await fetch(`https://api.github.com/repos/${repo}/contents/${filePath}`, {
+            method: "PUT",
+            headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                message: commitMessage,
+                content: Buffer.from(fileContent).toString("base64"),
+                sha: fileData.sha,
+                branch
+            })
+        });
 
-// =========================
-// Liaison ChatGPT → Bridge
-// =========================
-app.post("/relay-from-chatgpt", async (req, res) => {
-    const { message } = req.body;
-    if (!message) {
-        return res.status(400).json({ status: "error", message: "Aucun message reçu de ChatGPT" });
+        console.log("✅ Fichier mis à jour sur GitHub");
+
+        // 2️⃣ Déclencher redeploy Render
+        const renderDeploy = await fetch(`https://api.render.com/v1/services/${process.env.RENDER_SERVICE_ID}/deploys`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${process.env.RENDER_TOKEN}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ clearCache: false })
+        });
+
+        console.log("🚀 Redeploy Render déclenché");
+
+        res.json({ status: "success", message: "Mise à jour et redeploy lancés" });
+    } catch (error) {
+        console.error("❌ Erreur auto-update :", error);
+        res.status(500).json({ status: "error", message: "Erreur lors de la mise à jour" });
     }
-
-    console.log("💬 Message reçu depuis ChatGPT :", message);
-
-    // Transmettre au moteur de commande
-    executeGolixCommand(message);
-
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.json({ status: "relayed", message });
-});
-
-// =========================
-// Moteur de commandes Golix
-// =========================
-function executeGolixCommand(cmd) {
-    switch (cmd.toLowerCase()) {
-        case "démarre résilience & redondance":
-            console.log("🛡 Activation du mode Résilience & Redondance…");
-            // Ici, mets le code Golix réel pour activer ce mode
-            break;
-        case "analyse marché":
-            console.log("📊 Analyse en cours des marchés…");
-            // Ici, mets le code Golix d’analyse des marchés
-            break;
-        case "sécurité maximale":
-            console.log("🔐 Passage en sécurité maximale…");
-            // Ici, mets le code Golix pour activer le mode sécurité max
-            break;
-        default:
-            console.log("ℹ Commande Golix inconnue :", cmd);
-    }
-}
-
-// =========================
-// Lancement serveur
-// =========================
-app.listen(PORT, () => {
-    console.log(`Golix Bridge en ligne sur le port ${PORT}`);
 });

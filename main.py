@@ -1,26 +1,25 @@
-import os, json, time, urllib.parse
+import os, json, time, urllib.parse, math
 from datetime import datetime
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import httpx, feedparser
 
-# --- ENV ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")          # optionnel (si tu veux zéro coût, laisse vide)
+# === ENV ===
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")                 # optionnel
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "change-me")
 
-BRAVE_API_KEY  = os.getenv("BRAVE_API_KEY")           # pour recherche web gratuite
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")          # alternative à Brave (facultatif)
+BRAVE_API_KEY  = os.getenv("BRAVE_API_KEY")                  # recherche web gratuite
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")                 # alternative Google
 
 FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT")  # JSON complet
-FIREBASE_STORAGE_BUCKET  = os.getenv("FIREBASE_STORAGE_BUCKET")   # ex: ton-projet.appspot.com
+FIREBASE_STORAGE_BUCKET  = os.getenv("FIREBASE_STORAGE_BUCKET")   # ex: xxx.appspot.com
 
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY")     # pas utilisé pour le MVP
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")  # pas utilisé pour le MVP
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")           # optionnel (fallback 3)
 
 app = FastAPI(title="Golix Bridge")
 
-# --- Firebase (mémoire) ---
+# === Firebase (mémoire; optionnel) ===
 firebase_ready = False
 try:
     if FIREBASE_SERVICE_ACCOUNT and FIREBASE_STORAGE_BUCKET:
@@ -29,25 +28,26 @@ try:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
         firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
         firebase_ready = True
-except Exception as e:
+except Exception:
     firebase_ready = False
 
-# --- Modèles de données ---
+# === Data classes ===
 class ChatIn(BaseModel):
     user_id: str | None = None
     message: str
     context: dict | None = None
 
-# --- Helpers HTTP & OpenAI ---
+# === Helpers HTTP ===
 async def http_get_json(url, headers=None):
     async with httpx.AsyncClient(timeout=30) as cli:
         r = await cli.get(url, headers=headers)
         r.raise_for_status()
         return r.json()
 
+# === LLM (optionnel) ===
 async def openai_answer(prompt: str) -> str:
     if not OPENAI_API_KEY:
-        return "📝 (Pas d'OPENAI_API_KEY — réponse générée sans LLM)."
+        return "📝 (OPENAI_API_KEY absent — réponse courte hors LLM)."
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
@@ -63,24 +63,69 @@ async def openai_answer(prompt: str) -> str:
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
 
-# --- Outils gratuits ---
-async def binance_price(symbol: str):
-    s = symbol.upper().replace("/", "")
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={s}"
-    data = await http_get_json(url)
-    return {"symbol": s, "price": float(data["price"])}
+# === Prix: Binance -> fallback Coinpaprika -> (optionnel) CoinGecko ===
+COINPAPRIKA_IDS = {
+    "BTC":"btc-bitcoin","ETH":"eth-ethereum","BNB":"bnb-binance-coin","XRP":"xrp-xrp",
+    "SOL":"sol-solana","ADA":"ada-cardano","DOGE":"doge-dogecoin","AVAX":"avax-avalanche",
+    "DOT":"dot-polkadot","MATIC":"matic-polygon","TRX":"trx-tron","LINK":"link-chainlink",
+    "ATOM":"atom-cosmos","OP":"op-optimism","ARB":"arb-arbitrum"
+}
+COINGECKO_IDS = {"BTC":"bitcoin","ETH":"ethereum","BNB":"binancecoin","XRP":"ripple","SOL":"solana"}
 
+def _split(sym: str):
+    s = sym.upper().replace("/", "")
+    if s.endswith(("USDT","USDC")): return s[:-4], "USD"
+    if s.endswith("USD"): return s[:-3], "USD"
+    return s, "USD"
+
+async def binance_price(symbol: str):
+    base, _ = _split(symbol)
+    pair = f"{base}USDT"
+
+    # 1) Binance public
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
+        data = await http_get_json(url)
+        p = float(data["price"])
+        if not math.isfinite(p): raise ValueError("bad price")
+        return {"source":"binance","symbol":pair,"price":p}
+    except Exception:
+        pass
+
+    # 2) Coinpaprika (gratuit, sans clé)
+    pid = COINPAPRIKA_IDS.get(base)
+    if pid:
+        try:
+            url = f"https://api.coinpaprika.com/v1/tickers/{pid}"
+            data = await http_get_json(url)
+            p = float(data["quotes"]["USD"]["price"])
+            return {"source":"coinpaprika","symbol":f"{base}USD","price":p}
+        except Exception:
+            pass
+
+    # 3) CoinGecko (si tu mets une clé)
+    if COINGECKO_API_KEY and base in COINGECKO_IDS:
+        try:
+            headers = {"accept":"application/json","x-cg-api-key": COINGECKO_API_KEY}
+            cid = COINGECKO_IDS[base]
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd"
+            data = await http_get_json(url, headers=headers)
+            return {"source":"coingecko","symbol":f"{base}USD","price": float(data[cid]["usd"])}
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=502, detail=f"Impossible d'obtenir le prix pour {symbol}")
+
+# === Recherche Web ===
 async def web_search(query: str):
-    # Priorité Brave (gratuit). Sinon Serper si dispo. Sinon message d’erreur.
     q = query.strip()
     if BRAVE_API_KEY:
         headers = {"X-Subscription-Token": BRAVE_API_KEY}
         qs = urllib.parse.quote(q)
         url = f"https://api.search.brave.com/res/v1/web/search?q={qs}&count=5&freshness=pd"
         data = await http_get_json(url, headers=headers)
-        items = []
-        for it in data.get("web", {}).get("results", []):
-            items.append({"title": it.get("title"), "url": it.get("url")})
+        items = [{"title": it.get("title"), "url": it.get("url")}
+                 for it in data.get("web", {}).get("results", [])]
         return {"engine":"brave", "query": q, "results": items}
     if SERPER_API_KEY:
         headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type":"application/json"}
@@ -89,12 +134,11 @@ async def web_search(query: str):
             r = await cli.post("https://google.serper.dev/search", headers=headers, json=body)
             r.raise_for_status()
             data = r.json()
-        items = []
-        for it in data.get("organic", [])[:5]:
-            items.append({"title": it.get("title"), "url": it.get("link")})
+        items = [{"title": it.get("title"), "url": it.get("link")} for it in data.get("organic", [])[:5]]
         return {"engine":"serper", "query": q, "results": items}
     return {"error":"Aucune clé de recherche web (BRAVE_API_KEY ou SERPER_API_KEY)"}
 
+# === RSS + Sentiment ===
 CRYPTO_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://www.theblock.co/rss.xml",
@@ -102,20 +146,15 @@ CRYPTO_FEEDS = [
     "https://cointelegraph.com/rss",
     "https://www.reuters.com/markets/cryptocurrency/rss"
 ]
-
 async def rss_crypto_top(n=6):
-    items = []
-    now = time.time()
+    items, now = [], time.time()
     for url in CRYPTO_FEEDS:
         try:
             feed = feedparser.parse(url)
             for e in feed.entries[:4]:
-                ts = time.mktime(e.published_parsed) if hasattr(e, "published_parsed") and e.published_parsed else now
-                items.append({
-                    "title": getattr(e, "title", "(sans titre)"),
-                    "link": getattr(e, "link", ""),
-                    "published": ts
-                })
+                ts = time.mktime(e.published_parsed) if getattr(e,"published_parsed",None) else now
+                items.append({"title": getattr(e,"title","(sans titre)"),
+                              "link": getattr(e,"link",""), "published": ts})
         except Exception:
             continue
     items.sort(key=lambda x: x["published"], reverse=True)
@@ -126,15 +165,12 @@ async def rss_crypto_top(n=6):
     return out
 
 async def fear_greed():
-    url = "https://api.alternative.me/fng/?limit=1&format=json"
-    data = await http_get_json(url)
+    data = await http_get_json("https://api.alternative.me/fng/?limit=1&format=json")
     v = data.get("data", [{}])[0]
-    return {
-        "value": v.get("value"),
-        "classification": v.get("value_classification"),
-        "timestamp": v.get("timestamp")
-    }
+    return {"value": v.get("value"), "classification": v.get("value_classification"),
+            "timestamp": v.get("timestamp")}
 
+# === Firebase log (optionnel) ===
 async def firebase_log(text: str):
     if not firebase_ready:
         return {"ok": False, "error":"Firebase non configuré"}
@@ -146,7 +182,10 @@ async def firebase_log(text: str):
     blob.upload_from_string(text.encode("utf-8"), content_type="text/plain")
     return {"ok": True, "path": path}
 
-# --- Routes HTTP ---
+# === Routes HTTP ===
+@app.get("/")
+async def root(): return {"ok": True, "service": "golix-bridge"}
+
 @app.get("/ping")
 async def ping(): return {"ok": True, "firebase": firebase_ready}
 
@@ -166,21 +205,19 @@ async def http_rss_crypto():
 async def http_sentiment():
     return await fear_greed()
 
-# --- Route pilotée par Tampermonkey ---
+# === Chat (Tampermonkey ou GPT Actions) ===
 @app.post("/chat")
 async def chat(body: ChatIn, x_admin_token: str = Header(None)):
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     msg = (body.message or "").strip()
 
-    # 1) prix <pair>
     if msg.lower().startswith("prix "):
-        symbol = msg.split(" ", 1)[1].strip()
-        out = await binance_price(symbol)
-        return {"answer": f"{out['symbol']}: {out['price']}", "tools_ran":["binance_price"]}
+        pair = msg.split(" ", 1)[1].strip()
+        out = await binance_price(pair)
+        return {"answer": f"{out['symbol']}: {out['price']:.4f} (src: {out['source']})",
+                "tools_ran":["price"]}
 
-    # 2) web: <requete>
     if msg.lower().startswith("web:"):
         q = msg.split(":", 1)[1].strip()
         out = await web_search(q)
@@ -189,25 +226,23 @@ async def chat(body: ChatIn, x_admin_token: str = Header(None)):
         lines = [f"- {r['title']} ({r['url']})" for r in out["results"][:5]]
         return {"answer": "Top résultats :\n" + "\n".join(lines), "tools_ran":["web_search"]}
 
-    # 3) actu crypto
     if msg.lower() == "actu crypto":
         top = await rss_crypto_top()
         return {"answer": "Dernières actus :\n" + "\n".join(top), "tools_ran":["rss_crypto"]}
 
-    # 4) sentiment
     if msg.lower() == "sentiment":
         s = await fear_greed()
-        return {"answer": f"Fear&Greed: {s['value']} ({s['classification']})", "tools_ran":["fear_greed"]}
+        return {"answer": f"Fear&Greed: {s['value']} ({s['classification']})",
+                "tools_ran":["fear_greed"]}
 
-    # 5) memo: <texte> -> Firebase
     if msg.lower().startswith("memo:"):
         note = msg.split(":",1)[1].strip()
         res = await firebase_log(note)
         if res.get("ok"):
             return {"answer": f"Mémo enregistré: {res['path']}", "tools_ran":["firebase_log"]}
         else:
-            return {"answer": f"Impossible d'enregistrer le mémo ({res.get('error')}).", "tools_ran":[]}
+            return {"answer": f"Impossible d'enregistrer le mémo ({res.get('error')}).",
+                    "tools_ran":[]}
 
-    # 6) sinon → petite réponse (OpenAI si dispo)
     text = await openai_answer(msg)
     return {"answer": text, "tools_ran":[]}

@@ -1,70 +1,21 @@
-[GOLIX_RESTART_KIT_V2 — Reprise intégrale]
-
-OBJECTIF
-Mon assistant “Trading François” (GPT perso) pilote mon backend **golix-bridge** pour:
-- Prix crypto: /binance/price (Binance → fallback Coinpaprika)
-- Recherche web: /web/search (Brave/Serper)
-- Actus crypto: /rss/crypto
-- Sentiment marché: /sentiment
-- Mémo: stockage dans Firebase
-- Route /chat pour commandes depuis GPT ou Tampermonkey
-
-ÉTAT ACTUEL (OK/KO)
-- Render URL: https://golix-bridge.onrender.com
-- /ping → {"ok":true,"firebase":true} ✅
-- /rss/crypto → OK ✅
-- /sentiment → OK ✅
-- /web/search → OK si BRAVE_API_KEY est posée (sinon message d’erreur contrôlé)
-- /binance/price → doit marcher avec fallback Coinpaprika (aucune 500 attendue) ✅ après code ci-dessous
-- GPT “Trading François”: Actions branchées avec header `x-admin-token`
-
-RENDER — CONFIG À AVOIR
-Build Command:
-  pip install -r requirements.txt
-Start Command:
-  uvicorn main:app --host 0.0.0.0 --port $PORT
-
-requirements.txt:
-  fastapi
-  uvicorn
-  httpx
-  feedparser
-  firebase-admin
-
-Procfile:
-  web: uvicorn main:app --host 0.0.0.0 --port $PORT
-
-ENV VARS (Render → Settings → Environment) — mettre vos vraies valeurs
-  ADMIN_TOKEN              = <long_token_secret>
-  FIREBASE_SERVICE_ACCOUNT = { ...JSON complet du compte de service... }
-  FIREBASE_STORAGE_BUCKET  = <ex: bot-crypto-xxxx.appspot.com>
-  # Optionnels
-  BRAVE_API_KEY            = <token Brave>     # /web/search
-  SERPER_API_KEY           = <clé Serper>      # alternative web
-  OPENAI_API_KEY           = sk-...            # si réponses LLM via /chat
-  MODEL_NAME               = gpt-4o-mini
-  COINGECKO_API_KEY        = <clé>             # 3e fallback prix (optionnel)
-
-CODE — main.py (colle TOUT)
----------------------------------------------------------
 import os, json, time, urllib.parse, math
-from datetime import datetime, timedelta
+from datetime import datetime
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import httpx, feedparser
 
 # === ENV ===
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")                 # optionnel
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")                 # optionnel (peut rester vide)
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "change-me")
 
-BRAVE_API_KEY  = os.getenv("BRAVE_API_KEY")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+BRAVE_API_KEY  = os.getenv("BRAVE_API_KEY")                  # recherche web (gratuit)
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")                 # alternative
 
-FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT")
-FIREBASE_STORAGE_BUCKET  = os.getenv("FIREBASE_STORAGE_BUCKET")
+FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT")  # JSON complet
+FIREBASE_STORAGE_BUCKET  = os.getenv("FIREBASE_STORAGE_BUCKET")   # ex: xxx.appspot.com
 
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")  # optionnel
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")           # optionnel (fallback 3)
 
 app = FastAPI(title="Golix Bridge")
 
@@ -73,7 +24,7 @@ firebase_ready = False
 try:
     if FIREBASE_SERVICE_ACCOUNT and FIREBASE_STORAGE_BUCKET:
         import firebase_admin
-        from firebase_admin import credentials, storage, db
+        from firebase_admin import credentials, storage
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
         firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
         firebase_ready = True
@@ -86,14 +37,13 @@ class ChatIn(BaseModel):
     message: str
     context: dict | None = None
 
-# === HTTP helper ===
+# === Helpers ===
 async def http_get_json(url, headers=None):
     async with httpx.AsyncClient(timeout=30) as cli:
         r = await cli.get(url, headers=headers)
         r.raise_for_status()
         return r.json()
 
-# === LLM (optionnel) ===
 async def openai_answer(prompt: str) -> str:
     if not OPENAI_API_KEY:
         return "📝 (OPENAI_API_KEY absent — réponse courte hors LLM)."
@@ -130,7 +80,7 @@ def _split(sym: str):
 async def safe_price(symbol: str):
     base, _ = _split(symbol)
     pair = f"{base}USDT"
-    # 1) Binance
+    # 1) Binance public
     try:
         data = await http_get_json(f"https://api.binance.com/api/v3/ticker/price?symbol={pair}")
         p = float(data["price"])
@@ -138,7 +88,7 @@ async def safe_price(symbol: str):
             return {"source":"binance","symbol":pair,"price":p}
     except Exception as e:
         binance_err = str(e)
-    # 2) Coinpaprika
+    # 2) Coinpaprika (gratuit)
     try:
         pid = COINPAPRIKA_IDS.get(base)
         if pid:
@@ -147,16 +97,19 @@ async def safe_price(symbol: str):
             return {"source":"coinpaprika","symbol":f"{base}USD","price":p}
     except Exception as e:
         paprika_err = str(e)
-    # 3) CoinGecko (si clé)
+    # 3) CoinGecko (si clé posée)
     if COINGECKO_API_KEY and base in COINGECKO_IDS:
         try:
             headers = {"accept":"application/json","x-cg-api-key": COINGECKO_API_KEY}
             cid = COINGECKO_IDS[base]
-            data = await http_get_json(f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd", headers=headers)
+            data = await http_get_json(
+                f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd",
+                headers=headers
+            )
             return {"source":"coingecko","symbol":f"{base}USD","price": float(data[cid]["usd"])}
         except Exception:
             pass
-    # 4) Jamais 500: retour clair
+    # 4) Jamais 500: on renvoie une erreur claire en 200
     return {
         "error": f"Prix indisponible pour {symbol}",
         "binance_error": locals().get("binance_err"),
@@ -217,7 +170,7 @@ async def fear_greed():
     return {"value": v.get("value"), "classification": v.get("value_classification"),
             "timestamp": v.get("timestamp")}
 
-# === Firebase log (optionnel) ===
+# === Firebase log (mémo) ===
 async def firebase_log(text: str):
     if not firebase_ready:
         return {"ok": False, "error":"Firebase non configuré"}
@@ -252,17 +205,20 @@ async def http_rss_crypto():
 async def http_sentiment():
     return await fear_greed()
 
+# === Chat (pour GPT Actions/Tampermonkey) ===
 @app.post("/chat")
 async def chat(body: ChatIn, x_admin_token: str = Header(None)):
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
     msg = (body.message or "").strip()
+
     if msg.lower().startswith("prix "):
         pair = msg.split(" ", 1)[1].strip()
         out = await safe_price(pair)
         if "error" in out:
             return {"answer": f"Prix indisponible ({out['error']})", "tools_ran":["price"]}
         return {"answer": f"{out['symbol']}: {out['price']:.4f} (src: {out['source']})", "tools_ran":["price"]}
+
     if msg.lower().startswith("web:"):
         q = msg.split(":", 1)[1].strip()
         out = await web_search(q)
@@ -270,12 +226,15 @@ async def chat(body: ChatIn, x_admin_token: str = Header(None)):
             return {"answer": f"Recherche web désactivée ({out['error']}).", "tools_ran":[]}
         lines = [f"- {r['title']} ({r['url']})" for r in out["results"][:5]]
         return {"answer": "Top résultats :\n" + "\n".join(lines), "tools_ran":["web_search"]}
+
     if msg.lower() == "actu crypto":
         top = await rss_crypto_top()
         return {"answer": "Dernières actus :\n" + "\n".join(top), "tools_ran":["rss_crypto"]}
+
     if msg.lower() == "sentiment":
         s = await fear_greed()
         return {"answer": f"Fear&Greed: {s['value']} ({s['classification']})", "tools_ran":["fear_greed"]}
+
     if msg.lower().startswith("memo:"):
         note = msg.split(":",1)[1].strip()
         res = await firebase_log(note)
@@ -283,86 +242,6 @@ async def chat(body: ChatIn, x_admin_token: str = Header(None)):
             return {"answer": f"Mémo enregistré: {res['path']}", "tools_ran":["firebase_log"]}
         else:
             return {"answer": f"Impossible d'enregistrer le mémo ({res.get('error')}).", "tools_ran":[]}
+
     text = await openai_answer(msg)
     return {"answer": text, "tools_ran":[]}
----------------------------------------------------------
-
-TESTS RAPIDES (navigateur)
-  /ping
-  /binance/price?symbol=BTCUSDT
-  /rss/crypto
-  /sentiment
-  /web/search?q=bitcoin   (si BRAVE_API_KEY posée)
-
-GPT “Trading François” — Actions (OpenAPI)
-Colle ce YAML dans l’éditeur GPT → Actions → Import:
----------------------------------------------------------
-openapi: 3.1.0
-info:
-  title: Golix Bridge Actions
-  version: '1.0'
-servers:
-  - url: https://golix-bridge.onrender.com
-paths:
-  /binance/price:
-    get:
-      operationId: binance_price
-      summary: Prix spot d'une paire (Binance → fallback Coinpaprika)
-      parameters:
-        - in: query
-          name: symbol
-          required: true
-          schema: { type: string, example: BTCUSDT }
-  /web/search:
-    get:
-      operationId: web_search
-      parameters:
-        - in: query
-          name: q
-          required: true
-          schema: { type: string, example: bitcoin regulation }
-  /rss/crypto:
-    get:
-      operationId: rss_crypto
-  /sentiment:
-    get:
-      operationId: sentiment_fng
-  /chat:
-    post:
-      operationId: router_chat
-      security: [ { adminToken: [] } ]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                user_id: { type: string, example: francois }
-                message:  { type: string, example: "prix BTCUSDT" }
-components:
-  securitySchemes:
-    adminToken:
-      type: apiKey
-      in: header
-      name: x-admin-token
----------------------------------------------------------
-
-GPT — Auth de l’Action
-  Type: Clé API  → Personnalisé
-  Header name: x-admin-token
-  Value: <ADMIN_TOKEN exact de Render>
-
-COMMANDES À UTILISER (dans le GPT)
-  prix BTCUSDT
-  web: bitcoin regulation
-  actu crypto
-  sentiment
-  memo: idée de test
-
-DÉPANNAGE EXPRESS
-- /ping = firebase:false → vérifier FIREBASE_SERVICE_ACCOUNT (JSON complet) + FIREBASE_STORAGE_BUCKET, redeploy
-- Actions GPT “Regeneration must have conversation_id” → fermer l’éditeur, nouveau chat, ou ré-enregistrer l’auth
-- Prix renvoie {error:…} → copie le JSON et corrigeons la cause (réseau/ratelimit). Le service ne renverra plus 500.
-
-[FIN GOLIX_RESTART_KIT_V2]
